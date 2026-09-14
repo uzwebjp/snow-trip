@@ -266,12 +266,9 @@ body{background:#131A26;color:#EDF2F7;
 .stamp b{color:#EDF2F7;font-weight:600}
 .hero{margin:22px 0 8px;padding:22px 20px 20px;background:#1C2534;
  border-left:4px solid #FFB454;border-radius:3px}
-.hero .where{font-size:21px;font-weight:700}
+.hero .where{font-size:22px;font-weight:700}
 .hero .sub{color:#7C8AA0;font-size:13px;margin-top:5px}
-.hero .cm{font-size:68px;font-weight:800;line-height:1;margin-top:14px;
- color:#FFB454;font-variant-numeric:tabular-nums}
-.hero .cm span{font-size:22px;font-weight:600;margin-left:4px}
-.hero .cap{font-size:13px;color:#A7B4C6;margin-top:6px}
+.hero .cap{font-size:13px;color:#A7B4C6;margin-top:14px}
 .list{margin-top:26px;border-top:1px solid #2A3546}
 .row{padding:14px 2px 13px;border-bottom:1px solid #2A3546}
 .row .head{display:flex;align-items:baseline;justify-content:space-between;gap:12px}
@@ -279,10 +276,15 @@ body{background:#131A26;color:#EDF2F7;
 .row .where{color:#7C8AA0;font-size:12px;flex:none}
 .row .meta{color:#7C8AA0;font-size:12px;margin-top:8px}
 .models{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:9px}
-.models i{display:block;font-style:normal;font-size:11px;color:#7C8AA0;letter-spacing:.02em}
-.models b{font-size:23px;font-weight:700;color:#C7D3E4;font-variant-numeric:tabular-nums}
-.models u{font-size:11px;font-weight:600;text-decoration:none;color:#7C8AA0;margin-left:2px}
+.models i{display:block;font-style:normal;font-size:12px;color:#7C8AA0;letter-spacing:.02em}
+.models b{font-size:30px;font-weight:700;color:#C7D3E4;font-variant-numeric:tabular-nums}
+.models u{font-size:12px;font-weight:600;text-decoration:none;color:#7C8AA0;margin-left:2px}
 .models .hi b{color:#8FB4E8}
+.hero .models{margin-top:16px}
+.hero .models i{font-size:13px}
+.hero .models b{font-size:42px;color:#EDF2F7}
+.hero .models .hi b{color:#FFB454}
+.hero .models u{font-size:14px}
 .rain{color:#E2664F}
 .rain-note{color:#E2664F;font-size:12px}
 .bar{height:3px;background:#2A3546;border-radius:2px;overflow:hidden;margin-top:10px}
@@ -363,9 +365,8 @@ def render(rows, target, model, nmodels, path):
 <div class="hero">
   <div class="where">{html.escape(top["name"])}</div>
   <div class="sub">{top["area"]}　{access(top)}</div>
-  <div class="cm">{top["night"]:.0f}<span>cm</span></div>
-  <div class="cap">今夜17時から明朝8時までに<b>新しく降る</b>量。日中さらに{top["day"]:.0f}cm。</div>
   {model_strip(top)}
+  <div class="cap">今夜17時から明朝8時までに<b>新しく降る</b>量。日中さらに{top["day"]:.0f}cm。</div>
 </div>
 
 <div class="list">{body}</div>
