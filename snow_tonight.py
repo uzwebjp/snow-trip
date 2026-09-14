@@ -227,16 +227,16 @@ def analyse(offset, resorts, on_date=None):
         c, t850_min = cold_factor(t850)
         wf, wr = wind_factor(wd, ws, r["wind"])
 
-        agree = 0
+        by_model = {}
         for m, data in per_model.items():
             hh = data[i]["hourly"]
-            if sum(window(hh["time"], hh.get("snowfall"), night_start, night_end)) >= 5:
-                agree += 1
+            by_model[m] = sum(window(hh["time"], hh.get("snowfall"), night_start, night_end))
+        agree = sum(1 for v in by_model.values() if v >= 5)
 
         rows.append(dict(
             name=r["name"], area=r["area"], drive=r.get("drive"),
             trip=r.get("trip", False), top=r["top"], base=r["base"],
-            night=night, day=day, fl=fl_mean, t850=t850_min,
+            night=night, day=day, fl=fl_mean, t850=t850_min, by_model=by_model,
             wind_ratio=wr, quality=q,
             score=min(night, 50.0) * q * c * wf,
             agree=agree, models=len(per_model),
@@ -273,15 +273,19 @@ body{background:#131A26;color:#EDF2F7;
 .hero .cm span{font-size:22px;font-weight:600;margin-left:4px}
 .hero .cap{font-size:13px;color:#A7B4C6;margin-top:6px}
 .list{margin-top:26px;border-top:1px solid #2A3546}
-.row{padding:13px 2px;border-bottom:1px solid #2A3546}
+.row{padding:14px 2px 13px;border-bottom:1px solid #2A3546}
 .row .head{display:flex;align-items:baseline;justify-content:space-between;gap:12px}
-.row .nm{font-size:15px;font-weight:600}
-.row .meta{color:#7C8AA0;font-size:12px;margin-top:3px}
-.row .num{flex:none;font-size:27px;font-weight:700;font-variant-numeric:tabular-nums}
-.row .num u{font-size:12px;font-weight:600;text-decoration:none;color:#7C8AA0;margin-left:2px}
+.row .nm{font-size:16px;font-weight:600}
+.row .where{color:#7C8AA0;font-size:12px;flex:none}
+.row .meta{color:#7C8AA0;font-size:12px;margin-top:8px}
+.models{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:9px}
+.models i{display:block;font-style:normal;font-size:11px;color:#7C8AA0;letter-spacing:.02em}
+.models b{font-size:23px;font-weight:700;color:#C7D3E4;font-variant-numeric:tabular-nums}
+.models u{font-size:11px;font-weight:600;text-decoration:none;color:#7C8AA0;margin-left:2px}
+.models .hi b{color:#8FB4E8}
 .rain{color:#E2664F}
 .rain-note{color:#E2664F;font-size:12px}
-.bar{height:3px;background:#2A3546;border-radius:2px;overflow:hidden;margin-top:8px}
+.bar{height:3px;background:#2A3546;border-radius:2px;overflow:hidden;margin-top:10px}
 .bar i{display:block;height:100%;background:#5B86C4}
 h2{font-size:13px;font-weight:600;color:#7C8AA0;margin:30px 0 10px}
 .note{color:#7C8AA0;font-size:12.5px;line-height:1.75;margin-top:8px}
@@ -300,6 +304,27 @@ BOOKMARKS = [
 ]
 
 
+MODEL_LABEL = {
+    "jma_seamless": "気象庁",
+    "ecmwf_ifs025": "ECMWF",
+    "gfs_seamless": "GFS",
+}
+
+
+def model_strip(r):
+    parts = []
+    for key in MODELS:
+        if key not in r["by_model"]:
+            continue
+        v = r["by_model"][key]
+        cls = ' class="hi"' if v >= 5 else ""
+        parts.append(
+            f'<div{cls}><i>{MODEL_LABEL[key]}</i>'
+            f'<b>{v:.0f}</b><u>cm</u></div>'
+        )
+    return f'<div class="models">{"".join(parts)}</div>' if parts else ""
+
+
 def render(rows, target, model, nmodels, path):
     now = dt.datetime.now().strftime("%m/%d %H:%M")
     d = target.strftime("%m月%d日")
@@ -309,7 +334,6 @@ def render(rows, target, model, nmodels, path):
 
     def line(r):
         rain = r["quality"] < 0.5
-        cls = " rain" if rain else ""
         note = ""
         if rain and r["fl"]:
             note = f'　<span class="rain-note">雪線{r["fl"]:.0f}m・山麓は雨</span>'
@@ -318,11 +342,11 @@ def render(rows, target, model, nmodels, path):
             f'<div class="row">'
             f'<div class="head">'
             f'<div class="nm">{html.escape(r["name"])}</div>'
-            f'<div class="num{cls}">{r["night"]:.0f}<u>cm</u></div>'
+            f'<div class="where">{r["area"]}・{access(r)}</div>'
             f'</div>'
-            f'<div class="meta">{r["area"]}・{access(r)}　'
-            f'日中{r["day"]:.0f}cm　850hPa {t850}　'
-            f'風向{r["wind_ratio"]*100:.0f}%　一致{r["agree"]}/{r["models"]}{note}</div>'
+            f'{model_strip(r)}'
+            f'<div class="meta">日中{r["day"]:.0f}cm　850hPa {t850}　'
+            f'風向{r["wind_ratio"]*100:.0f}%{note}</div>'
             f'<div class="bar"><i style="width:{min(r["night"]/mx*100,100):.0f}%"></i></div>'
             f'</div>'
         )
@@ -334,27 +358,34 @@ def render(rows, target, model, nmodels, path):
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark">
 <title>翌朝の新雪 {d}</title><style>{CSS}</style></head><body><div class="wrap">
-<p class="stamp">{d}（{wd}）朝の<b>新雪</b>見込み　<b>{now} 更新</b>　{model} / {nmodels}モデル照合</p>
+<p class="stamp">{d}（{wd}）朝の<b>新雪</b>見込み　<b>{now} 更新</b>　順位は気象庁モデル基準</p>
 
 <div class="hero">
   <div class="where">{html.escape(top["name"])}</div>
   <div class="sub">{top["area"]}　{access(top)}</div>
   <div class="cm">{top["night"]:.0f}<span>cm</span></div>
-  <div class="cap">今夜17時から明朝8時までに<b>新しく降る</b>量。日中さらに{top["day"]:.0f}cm。
-  {top["models"]}モデル中{top["agree"]}つが一致。</div>
+  <div class="cap">今夜17時から明朝8時までに<b>新しく降る</b>量。日中さらに{top["day"]:.0f}cm。</div>
+  {model_strip(top)}
 </div>
 
 <div class="list">{body}</div>
 
 <h2>読み方</h2>
 <p class="note">
-大きい数字は<b>新雪</b>の量で、翌朝ファーストトラックで踏める深さの目安です。
+数字は<b>新雪</b>の量で、翌朝ファーストトラックで踏める深さの目安です。
 地面に積もっている総量（積雪深）は出していません。そちらは下のウェザーニュースか各スキー場の発表を見てください。<br>
+<b>気象庁・ECMWF・GFSの3つの数値予報モデルが、それぞれ何cmと言っているかを並べています。</b>
+列の位置は全行で揃えてあるので、縦に目を走らせればスキー場どうしを比べられます。
+青い数字は5cm以上を予想したモデルで、<b>3つとも青い日は当たりの確度が高い</b>。
+1つだけ突出している日は、そのモデルだけが違う絵を描いているので様子見が無難です。
+天気予報サイトごとに数字が食い違うのは、どのモデルを使っているかの差です。ここを直接見れば、サイトを見比べる手間が省けます。
+ただし3つは同じ観測データから出発しているので、揃って外れることもあります。<br>
+並び順は気象庁モデルの値で決めています。日本の地形を扱う解像度がいちばん高いためですが、
+どのモデルが当たりやすいかは検証できていません。<br>
 新雪の量は、水量から一定の係数で換算した値です。気温が低く乾いた雪ほど実際にはもっと嵩が出るので、
-<b>本当のパウダーの日はこの数字より深くなります</b>。絶対値より、候補どうしの大小と一致数で判断してください。<br>
+<b>本当のパウダーの日はこの数字より深くなります</b>。絶対値より、候補どうしの大小とモデルの揃い方で判断してください。<br>
 赤字は雪線が山腹より上にあり、山麓が雨になる可能性が高いことを示します。
-風向%は、そのスキー場に雪を運ぶ風向に850hPaの風が入っている時間の割合。
-一致は、夜間5cm以上を予想したモデルの数で、<b>3つ揃った日は当たりの確度が高い</b>。<br>
+風向%は、そのスキー場に雪を運ぶ風向に850hPaの風が入っている時間の割合。<br>
 数字が近い候補が並んだら、車の時間が短いほうを選ぶのが現実的です。
 夜間降雪が多い日は道路も荒れるので、出発前に下の除雪ナビとiHighwayを必ず見てください。
 </p>
@@ -397,8 +428,10 @@ def main():
     print(f"\n{label}{target:%Y/%m/%d} 朝の新雪見込み（{model} / {n}モデル照合 / {len(rs)}スキー場）\n")
     for i, r in enumerate(rows[:10], 1):
         mark = " ※山麓は雨" if r["quality"] < 0.5 else ""
+        ms = "  ".join(f"{MODEL_LABEL[k]}{r['by_model'][k]:4.1f}"
+                       for k in MODELS if k in r["by_model"])
         print(f"{i:2}. {r['name']:<14} 新雪{r['night']:5.1f}cm  日中{r['day']:5.1f}cm  "
-              f"{access(r):<7} 一致{r['agree']}/{r['models']}{mark}")
+              f"[{ms}]  {access(r)}{mark}")
     path = os.path.abspath(args.out)
     print(f"\nHTML: {path}\n")
     if args.open:
