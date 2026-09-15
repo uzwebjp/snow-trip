@@ -15,6 +15,9 @@ snow_tonight.py  --  夕方出発 → 翌日滑走 のためのスキー場判�
     python snow_tonight.py --area 妙高 白馬
     python snow_tonight.py --max-drive 3      # 片道3時間以内だけ
     python snow_tonight.py --open             # 書き出し後ブラウザで開く
+    python snow_tonight.py --nav              # index.html / all.html への切り替えリンクを付ける
+
+朝8時より前に実行したときは、いま明けつつある夜（昨夜17時→今朝8時）の分を出す。
 
 依存: 標準ライブラリのみ
 """
@@ -25,6 +28,7 @@ import html
 import json
 import os
 import sys
+import time
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -103,6 +107,18 @@ MODELS = ["jma_seamless", "ecmwf_ifs025", "gfs_seamless"]
 NIGHT = (17, 8)   # 当日17時 → 翌8時
 DAY = (8, 16)     # 翌8時 → 翌16時
 DAY_TRIP_HOURS = 5.5   # これ以内なら夕方出発の日帰り圏（妙高まで）
+SNOWLINE_BELOW_FL = 300   # 雪線は0℃高度よりおよそ300m低い
+LAPSE = 6.5               # 気温減率(℃/km)。0℃高度が取れないときに山頂気温から推定する
+NO_SNOW_CM = 1            # 1位でもこれ未満なら「どこも降らない」表示にする
+RAIN_MM = 1               # 夜間の降水がこれ未満なら、雪線が高くても雨の表示はしない
+STALE_HOURS = 13          # 定時実行の間隔は最大12時間（4時→16時）。これを超えたら警告
+FETCH_TRIES = 3           # Open-Meteo は一時的に接続が切れることがあるので再試行する
+
+# 一覧どうしの切り替えリンク（--nav）。GitHub Pages 上のファイル名
+NAV = [
+    ("日帰り圏", "index.html"),
+    ("東北・立山も含む", "all.html"),
+]
 
 
 def fetch(resorts, hourly, model, days, start=None, end=None):
@@ -121,15 +137,19 @@ def fetch(resorts, hourly, model, days, start=None, end=None):
     else:
         url = API
         params["forecast_days"] = str(days)
+        params["past_days"] = "1"   # 朝8時前の実行で昨夜17時からの分を取るため
 
     url = url + "?" + urllib.parse.urlencode(params)
-    try:
-        with urllib.request.urlopen(url, timeout=60) as res:
-            data = json.loads(res.read().decode())
-    except Exception as e:
-        print(f"[warn] {model} 取得失敗: {e}", file=sys.stderr)
-        return None
-    return data if isinstance(data, list) else [data]
+    for attempt in range(1, FETCH_TRIES + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=60) as res:
+                data = json.loads(res.read().decode())
+            return data if isinstance(data, list) else [data]
+        except Exception as e:
+            print(f"[warn] {model} 取得失敗 ({attempt}/{FETCH_TRIES}): {e}", file=sys.stderr)
+            if attempt < FETCH_TRIES:
+                time.sleep(5 * attempt)
+    return None
 
 
 def window(times, values, start_dt, end_dt):
@@ -146,31 +166,39 @@ def angle_diff(a, b):
     return d if d <= 180 else 360 - d
 
 
-def quality_factor(fl_vals, top, base):
-    if not fl_vals:
-        return 0.8, None
-    fl = sum(fl_vals) / len(fl_vals)
-    if fl <= base:
-        return 1.0, fl
-    if fl >= top:
-        return 0.15, fl
-    return 0.15 + 0.85 * (top - fl) / max(top - base, 1), fl
+def resolve_target(offset, now):
+    """滑る日を決める。朝8時前は、いま明けつつある夜の分を見たいので当日を1日目とする"""
+    first = now.date() if now.hour < NIGHT[1] else now.date() + dt.timedelta(days=1)
+    return first + dt.timedelta(days=offset - 1)
 
 
-def cold_factor(t850):
-    if not t850:
-        return 1.0, None
-    t = min(t850)
-    if t <= -12:
-        return 1.20, t
-    if t <= -9:
-        return 1.10, t
-    if t <= -6:
-        return 1.00, t
-    return 0.85, t
+def night_label(target, today):
+    if target == today:
+        return "昨夜17時から今朝8時まで"
+    if target == today + dt.timedelta(days=1):
+        return "今夜17時から明朝8時まで"
+    prev = target - dt.timedelta(days=1)
+    return f"{prev.month}/{prev.day} 17時から{target.month}/{target.day} 8時まで"
 
 
-def wind_factor(dirs, speeds, favored):
+def snowline(per_model, order, i, r, start_dt, end_dt):
+    """夜間の平均雪線高度(m)。0℃高度はGFSにしか無いことが多いので、あるモデルを順に探す"""
+    for m in order:
+        h = per_model[m][i]["hourly"]
+        fl = window(h["time"], h.get("freezing_level_height"), start_dt, end_dt)
+        if fl:
+            return sum(fl) / len(fl) - SNOWLINE_BELOW_FL
+    for m in order:
+        h = per_model[m][i]["hourly"]
+        temps = window(h["time"], h.get("temperature_2m"), start_dt, end_dt)
+        if temps:
+            fl = r["top"] + sum(temps) / len(temps) / LAPSE * 1000
+            return fl - SNOWLINE_BELOW_FL
+    return None
+
+
+def wind_ratio(dirs, speeds, favored):
+    """雪を運ぶ向きの風が吹いていた時間の割合。強い風が1時間も無ければ None"""
     center, tol = favored
     hits = total = 0
     for d, s in zip(dirs, speeds):
@@ -179,23 +207,20 @@ def wind_factor(dirs, speeds, favored):
         total += 1
         if angle_diff(d, center) <= tol:
             hits += 1
-    if total == 0:
-        return 1.0, 0.0
-    r = hits / total
-    return 1.0 + 0.30 * r, r
+    return hits / total if total else None
 
 
 def analyse(offset, resorts, on_date=None):
-    today = dt.date.today()
-    target = on_date or (today + dt.timedelta(days=offset))
+    now = dt.datetime.now()
+    target = on_date or resolve_target(offset, now)
     night_start = dt.datetime.combine(target - dt.timedelta(days=1), dt.time(NIGHT[0]))
     night_end = dt.datetime.combine(target, dt.time(NIGHT[1]))
     day_start = dt.datetime.combine(target, dt.time(DAY[0]))
     day_end = dt.datetime.combine(target, dt.time(DAY[1]))
-    need = offset + 2
+    need = max((target - now.date()).days + 1, 1)
     span = (target - dt.timedelta(days=1), target) if on_date else (None, None)
 
-    surf_vars = ["snowfall", "freezing_level_height", "temperature_2m"]
+    surf_vars = ["snowfall", "precipitation", "freezing_level_height", "temperature_2m"]
     pres_vars = ["temperature_850hPa", "wind_direction_850hPa", "wind_speed_850hPa"]
 
     per_model = {}
@@ -208,41 +233,41 @@ def analyse(offset, resorts, on_date=None):
     pres = fetch(resorts, pres_vars, "gfs_seamless", need, *span)
 
     main = "jma_seamless" if "jma_seamless" in per_model else list(per_model)[0]
+    order = [main] + [m for m in per_model if m != main]
     rows = []
     for i, r in enumerate(resorts):
+        by_model = {}
+        for m, data in per_model.items():
+            hh = data[i]["hourly"]
+            by_model[m] = sum(window(hh["time"], hh.get("snowfall"), night_start, night_end))
         h = per_model[main][i]["hourly"]
-        t = h["time"]
-        night = sum(window(t, h.get("snowfall"), night_start, night_end))
-        day = sum(window(t, h.get("snowfall"), day_start, day_end))
-        fl = window(t, h.get("freezing_level_height"), day_start, day_end)
-        q, fl_mean = quality_factor(fl, r["top"], r["base"])
+        day = sum(window(h["time"], h.get("snowfall"), day_start, day_end))
+        precip = sum(window(h["time"], h.get("precipitation"), night_start, night_end))
 
-        t850 = wd = ws = []
+        sl = snowline(per_model, order, i, r, night_start, night_end)
+        rain = precip >= RAIN_MM and sl is not None and sl > (r["top"] + r["base"]) / 2
+
+        t850_min = wr = None
         if pres:
             ph = pres[i]["hourly"]
             pt = ph["time"]
             t850 = window(pt, ph.get("temperature_850hPa"), night_start, day_end)
             wd = window(pt, ph.get("wind_direction_850hPa"), night_start, day_end)
             ws = window(pt, ph.get("wind_speed_850hPa"), night_start, day_end)
-        c, t850_min = cold_factor(t850)
-        wf, wr = wind_factor(wd, ws, r["wind"])
-
-        by_model = {}
-        for m, data in per_model.items():
-            hh = data[i]["hourly"]
-            by_model[m] = sum(window(hh["time"], hh.get("snowfall"), night_start, night_end))
-        agree = sum(1 for v in by_model.values() if v >= 5)
+            t850_min = min(t850) if t850 else None
+            wr = wind_ratio(wd, ws, r["wind"])
 
         rows.append(dict(
             name=r["name"], area=r["area"], drive=r.get("drive"),
             trip=r.get("trip", False), top=r["top"], base=r["base"],
-            night=night, day=day, fl=fl_mean, t850=t850_min, by_model=by_model,
-            wind_ratio=wr, quality=q,
-            score=min(night, 50.0) * q * c * wf,
-            agree=agree, models=len(per_model),
+            night=by_model[main], day=day, snowline=sl, rain=rain,
+            t850=t850_min, wind_ratio=wr, has_pres=pres is not None,
+            by_model=by_model,
         ))
-    rows.sort(key=lambda x: -x["score"])
-    return rows, target, main, len(per_model)
+    # 表示している主モデルの cm で並べる。同じ cm なら雨の心配が無いほう → 車の時間が短いほう
+    rows.sort(key=lambda x: (-round(x["night"]), x["rain"],
+                             x["drive"] if x["drive"] is not None else 99))
+    return rows, target, main, list(per_model)
 
 
 def access(r):
@@ -264,28 +289,39 @@ body{background:#131A26;color:#EDF2F7;
 .wrap{max-width:620px;margin:0 auto}
 .stamp{color:#7C8AA0;font-size:13px}
 .stamp b{color:#EDF2F7;font-weight:600}
+.nav{display:flex;flex-wrap:wrap;gap:6px 16px;margin-top:10px;font-size:13px}
+.nav a{color:#A7B4C6}
+.nav a[aria-current]{color:#EDF2F7;font-weight:600;text-decoration:none}
+.stale{margin-top:14px;padding:10px 12px;border:1px solid #E2664F;border-radius:3px;
+ color:#F3B3A6;font-size:13px}
 .hero{margin:22px 0 8px;padding:22px 20px 20px;background:#1C2534;
  border-left:4px solid #FFB454;border-radius:3px}
 .hero .where{font-size:22px;font-weight:700}
 .hero .sub{color:#7C8AA0;font-size:13px;margin-top:5px}
 .hero .cap{font-size:13px;color:#A7B4C6;margin-top:14px}
+.hero.empty{border-left-color:#5B6B82}
+.hero.empty .where{font-size:18px}
 .list{margin-top:26px;border-top:1px solid #2A3546}
 .row{padding:14px 2px 13px;border-bottom:1px solid #2A3546}
 .row .head{display:flex;align-items:baseline;justify-content:space-between;gap:12px}
 .row .nm{font-size:16px;font-weight:600}
 .row .where{color:#7C8AA0;font-size:12px;flex:none}
-.row .meta{color:#7C8AA0;font-size:12px;margin-top:8px}
+.meta{color:#7C8AA0;font-size:12px;margin-top:8px}
+.hero .meta{margin-top:10px}
 .models{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:9px}
 .models i{display:block;font-style:normal;font-size:12px;color:#7C8AA0;letter-spacing:.02em}
 .models b{font-size:30px;font-weight:700;color:#C7D3E4;font-variant-numeric:tabular-nums}
 .models u{font-size:12px;font-weight:600;text-decoration:none;color:#7C8AA0;margin-left:2px}
 .models .hi b{color:#8FB4E8}
+.models .na b{color:#4A5870}
+.models s{display:block;text-decoration:none;font-size:11px;color:#E2664F}
 .hero .models{margin-top:16px}
 .hero .models i{font-size:13px}
 .hero .models b{font-size:42px;color:#EDF2F7}
 .hero .models .hi b{color:#FFB454}
+.hero .models .na b{color:#4A5870}
 .hero .models u{font-size:14px}
-.rain{color:#E2664F}
+.warn{color:#E2664F}
 .rain-note{color:#E2664F;font-size:12px}
 .bar{height:3px;background:#2A3546;border-radius:2px;overflow:hidden;margin-top:10px}
 .bar i{display:block;height:100%;background:#5B86C4}
@@ -294,8 +330,26 @@ h2{font-size:13px;font-weight:600;color:#7C8AA0;margin:30px 0 10px}
 .links{margin-top:26px;display:flex;flex-wrap:wrap;gap:8px}
 .links a{color:#A7B4C6;font-size:13px;text-decoration:none;
  border:1px solid #2A3546;border-radius:3px;padding:7px 11px}
-.links a:focus-visible{outline:2px solid #FFB454;outline-offset:2px}
+.links a:focus-visible,.nav a:focus-visible{outline:2px solid #FFB454;outline-offset:2px}
 """
+
+# 開いた時点で更新からの経過時間を出し、止まっていたら警告する
+SCRIPT = """<script>
+(function(){
+  var g = new Date(document.body.getAttribute("data-generated"));
+  var h = (Date.now() - g.getTime()) / 36e5;
+  if (!isFinite(h)) return;
+  document.getElementById("age").textContent =
+    h < 1 ? "（1時間以内）" : "（" + Math.floor(h) + "時間前）";
+  if (h <= __STALE__) return;
+  var m = new Date().getMonth() + 1;
+  var s = document.getElementById("stale");
+  s.textContent = (m >= 6 && m <= 10)
+    ? "シーズン外（6〜10月）は自動更新を止めています。表示は最後に更新したときの予報です。"
+    : "最終更新から" + Math.floor(h) + "時間たっています。自動更新が止まっている可能性があります。";
+  s.hidden = false;
+})();
+</script>""".replace("__STALE__", str(STALE_HOURS))
 
 BOOKMARKS = [
     ("Windy 新雪", "https://www.windy.com/ja/-%E6%96%B0%E9%9B%AA-snowAccu?snowAccu,35.954,137.867,8"),
@@ -316,30 +370,53 @@ MODEL_LABEL = {
 def model_strip(r):
     parts = []
     for key in MODELS:
+        label = MODEL_LABEL.get(key, key)
         if key not in r["by_model"]:
+            parts.append(f'<div class="na"><i>{label}</i><b>—</b><s>取得失敗</s></div>')
             continue
         v = r["by_model"][key]
         cls = ' class="hi"' if v >= 5 else ""
         parts.append(
-            f'<div{cls}><i>{MODEL_LABEL[key]}</i>'
+            f'<div{cls}><i>{label}</i>'
             f'<b>{v:.0f}</b><u>cm</u></div>'
         )
-    return f'<div class="models">{"".join(parts)}</div>' if parts else ""
+    return f'<div class="models">{"".join(parts)}</div>'
 
 
-def render(rows, target, model, nmodels, path):
-    now = dt.datetime.now().strftime("%m/%d %H:%M")
+def meta(r):
+    t850 = f'{r["t850"]:.0f}℃' if r["t850"] is not None else "—"
+    if not r["has_pres"]:
+        wind = "風向—"
+    elif r["wind_ratio"] is None:
+        wind = "風弱"
+    else:
+        wind = f'風向{r["wind_ratio"]*100:.0f}%'
+    note = ""
+    if r["rain"]:
+        note = f'　<span class="rain-note">雪線{r["snowline"]:.0f}m・山麓は雨</span>'
+    return f'<div class="meta">日中{r["day"]:.0f}cm　850hPa {t850}　{wind}{note}</div>'
+
+
+def nav_html(path):
+    here = os.path.basename(path)
+    parts = []
+    for label, href in NAV:
+        if href == here:
+            parts.append(f'<a aria-current="page">{html.escape(label)}</a>')
+        else:
+            parts.append(f'<a href="{href}">{html.escape(label)}</a>')
+    return f'<nav class="nav">{"".join(parts)}</nav>'
+
+
+def render(rows, target, main, available, path, nav=False):
+    now = dt.datetime.now()
     d = target.strftime("%m月%d日")
     wd = "月火水木金土日"[target.weekday()]
     top = rows[0]
     mx = max((r["night"] for r in rows), default=1) or 1
+    period = night_label(target, now.date())
 
     def line(r):
-        rain = r["quality"] < 0.5
-        note = ""
-        if rain and r["fl"]:
-            note = f'　<span class="rain-note">雪線{r["fl"]:.0f}m・山麓は雨</span>'
-        t850 = f'{r["t850"]:.0f}℃' if r["t850"] is not None else "—"
         return (
             f'<div class="row">'
             f'<div class="head">'
@@ -347,27 +424,42 @@ def render(rows, target, model, nmodels, path):
             f'<div class="where">{r["area"]}・{access(r)}</div>'
             f'</div>'
             f'{model_strip(r)}'
-            f'<div class="meta">日中{r["day"]:.0f}cm　850hPa {t850}　'
-            f'風向{r["wind_ratio"]*100:.0f}%{note}</div>'
+            f'{meta(r)}'
             f'<div class="bar"><i style="width:{min(r["night"]/mx*100,100):.0f}%"></i></div>'
             f'</div>'
         )
 
+    if round(top["night"]) < NO_SNOW_CM:
+        hero = f"""<div class="hero empty">
+  <div class="where">どのスキー場も新雪は1cm未満の見込み</div>
+  <div class="cap">{period}に<b>新しく降る</b>量で、{MODEL_LABEL.get(main, main)}モデルが1cm以上を出したスキー場がありません。</div>
+</div>"""
+        body = "".join(line(r) for r in rows)
+    else:
+        thin = "　まとまった新雪ではありません。" if top["night"] < 5 else ""
+        hero = f"""<div class="hero">
+  <div class="where">{html.escape(top["name"])}</div>
+  <div class="sub">{top["area"]}　{access(top)}</div>
+  {model_strip(top)}
+  {meta(top)}
+  <div class="cap">{period}に<b>新しく降る</b>量。日中さらに{top["day"]:.0f}cm。{thin}</div>
+</div>"""
+        body = "".join(line(r) for r in rows[1:])
+
+    missing = [MODEL_LABEL.get(m, m) for m in MODELS if m not in available]
+    warn = f'　<span class="warn">{"・".join(missing)}は取得失敗</span>' if missing else ""
     links = "".join(f'<a href="{u}">{html.escape(n)}</a>' for n, u in BOOKMARKS)
-    body = "".join(line(r) for r in rows[1:])
+    generated = now.astimezone().isoformat(timespec="minutes")
 
     doc = f"""<!doctype html><html lang="ja"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark">
-<title>翌朝の新雪 {d}</title><style>{CSS}</style></head><body><div class="wrap">
-<p class="stamp">{d}（{wd}）朝の<b>新雪</b>見込み　<b>{now} 更新</b>　順位は気象庁モデル基準</p>
+<title>翌朝の新雪 {d}</title><style>{CSS}</style></head><body data-generated="{generated}"><div class="wrap">
+<p class="stamp">{d}（{wd}）朝の<b>新雪</b>見込み　<b>{now:%m/%d %H:%M} 更新</b><span id="age"></span>　順位は{MODEL_LABEL.get(main, main)}モデル基準{warn}</p>
+{nav_html(path) if nav else ""}
+<div class="stale" id="stale" hidden></div>
 
-<div class="hero">
-  <div class="where">{html.escape(top["name"])}</div>
-  <div class="sub">{top["area"]}　{access(top)}</div>
-  {model_strip(top)}
-  <div class="cap">今夜17時から明朝8時までに<b>新しく降る</b>量。日中さらに{top["day"]:.0f}cm。</div>
-</div>
+{hero}
 
 <div class="list">{body}</div>
 
@@ -381,31 +473,34 @@ def render(rows, target, model, nmodels, path):
 1つだけ突出している日は、そのモデルだけが違う絵を描いているので様子見が無難です。
 天気予報サイトごとに数字が食い違うのは、どのモデルを使っているかの差です。ここを直接見れば、サイトを見比べる手間が省けます。
 ただし3つは同じ観測データから出発しているので、揃って外れることもあります。<br>
-並び順は気象庁モデルの値で決めています。日本の地形を扱う解像度がいちばん高いためですが、
-どのモデルが当たりやすいかは検証できていません。<br>
+並び順は気象庁モデルの値（cm）で決めています。日本の地形を扱う解像度がいちばん高いためですが、
+どのモデルが当たりやすいかは検証できていません。同じcmなら、雨の心配が無いほう、車の時間が短いほうを上にしています。<br>
 新雪の量は、水量から一定の係数で換算した値です。気温が低く乾いた雪ほど実際にはもっと嵩が出るので、
 <b>本当のパウダーの日はこの数字より深くなります</b>。絶対値より、候補どうしの大小とモデルの揃い方で判断してください。<br>
-赤字は雪線が山腹より上にあり、山麓が雨になる可能性が高いことを示します。
-風向%は、そのスキー場に雪を運ぶ風向に850hPaの風が入っている時間の割合。<br>
+赤字は、夜間の雪線（0℃になる高さの約300m下）が山頂と山麓の中間より上にあり、山麓が雨になる可能性が高いことを示します。
+風向%は、そのスキー場に雪を運ぶ風向に850hPaの風が入っている時間の割合。「風弱」は判定できるほどの風が吹いていないという意味です。<br>
 数字が近い候補が並んだら、車の時間が短いほうを選ぶのが現実的です。
 夜間降雪が多い日は道路も荒れるので、出発前に下の除雪ナビとiHighwayを必ず見てください。
 </p>
 
 <div class="links">{links}</div>
-</div></body></html>"""
+</div>
+{SCRIPT}
+</body></html>"""
     with open(path, "w", encoding="utf-8") as f:
         f.write(doc)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--offset", type=int, default=1, help="何日後に滑るか（既定=1: 明日）")
+    ap.add_argument("--offset", type=int, default=1, help="何日後に滑るか（既定=1: 明日。朝8時前は今日）")
     ap.add_argument("--area", nargs="*", help="滋賀 福井 岐阜 石川 白馬 北信 志賀 妙高 湯沢 東北 立山")
     ap.add_argument("--max-drive", type=float)
     ap.add_argument("--trip", action="store_true", help="東北など車の日帰り圏外も含める")
     ap.add_argument("--today", action="store_true", help=f"片道{DAY_TRIP_HOURS}時間以内の日帰り圏だけ")
     ap.add_argument("--date", help="過去日で検証 (YYYY-MM-DD)。--offset は無視される")
     ap.add_argument("--out", default="ranking.html")
+    ap.add_argument("--nav", action="store_true", help="index.html / all.html への切り替えリンクを付ける")
     ap.add_argument("--open", action="store_true")
     args = ap.parse_args()
 
@@ -422,14 +517,14 @@ def main():
         sys.exit("条件に合うスキー場がありません")
 
     on_date = dt.date.fromisoformat(args.date) if args.date else None
-    rows, target, model, n = analyse(args.offset, rs, on_date)
-    render(rows, target, model, n, args.out)
+    rows, target, main_model, available = analyse(args.offset, rs, on_date)
+    render(rows, target, main_model, available, args.out, nav=args.nav)
 
     label = "【過去日で検証】" if on_date else ""
-    print(f"\n{label}{target:%Y/%m/%d} 朝の新雪見込み（{model} / {n}モデル照合 / {len(rs)}スキー場）\n")
+    print(f"\n{label}{target:%Y/%m/%d} 朝の新雪見込み（{main_model} / {len(available)}モデル照合 / {len(rs)}スキー場）\n")
     for i, r in enumerate(rows[:10], 1):
-        mark = " ※山麓は雨" if r["quality"] < 0.5 else ""
-        ms = "  ".join(f"{MODEL_LABEL[k]}{r['by_model'][k]:4.1f}"
+        mark = f" ※雪線{r['snowline']:.0f}m・山麓は雨" if r["rain"] else ""
+        ms = "  ".join(f"{MODEL_LABEL.get(k, k)}{r['by_model'][k]:4.1f}"
                        for k in MODELS if k in r["by_model"])
         print(f"{i:2}. {r['name']:<14} 新雪{r['night']:5.1f}cm  日中{r['day']:5.1f}cm  "
               f"[{ms}]  {access(r)}{mark}")
